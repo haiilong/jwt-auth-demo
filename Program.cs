@@ -38,23 +38,36 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             ValidateLifetime = true,
             ClockSkew = TimeSpan.Zero,
         };
+        
+        options.Events = new JwtBearerEvents
+        {
+            OnMessageReceived = context =>
+            {
+                if (context.Request.Cookies.TryGetValue("X-Access-Token", out var token))
+                {
+                    context.Token = token;
+                }
+                return Task.CompletedTask;
+            }
+        };
     });
 builder.Services.AddAuthorization();
 
-// --- OPENAPI (Bearer Definition) ---
+// --- OPENAPI (Cookie Definition) ---
 builder.Services.AddOpenApi("v1", options =>
 {
-    // 1. Define "Bearer" Scheme
+    // 1. Define "Cookie" Scheme
     options.AddDocumentTransformer((document, _, _) =>
     {
-        document.Info = new OpenApiInfo { Title = "Bearer API", Version = "v1" };
+        document.Info = new OpenApiInfo { Title = "Cookie API", Version = "v1" };
         document.Components ??= new OpenApiComponents();
-        document.Components.SecuritySchemes.Add("Bearer", new OpenApiSecurityScheme
+
+        document.Components.SecuritySchemes.Add("CookieAuth", new OpenApiSecurityScheme
         {
-            Type = SecuritySchemeType.Http,
-            Scheme = "bearer",
-            BearerFormat = "JWT",
-            Description = "Enter access token here"
+            Type = SecuritySchemeType.ApiKey,
+            In = ParameterLocation.Cookie,
+            Name = "X-Access-Token", 
+            Description = "Auth handled automatically via Cookies"
         });
         return Task.CompletedTask;
     });
@@ -66,7 +79,7 @@ builder.Services.AddOpenApi("v1", options =>
         {
             operation.Security = new List<OpenApiSecurityRequirement>
             {
-                new() { { new OpenApiSecurityScheme { Reference = new OpenApiReference { Type = ReferenceType.SecurityScheme, Id = "Bearer" } }, Array.Empty<string>() } }
+                new() { { new OpenApiSecurityScheme { Reference = new OpenApiReference { Type = ReferenceType.SecurityScheme, Id = "CookieAuth" } }, Array.Empty<string>() } }
             };
         }
         return Task.CompletedTask;
@@ -84,6 +97,7 @@ app.MapScalarApiReference(options =>
     options.HideModels = true;
     options.HideSearch = true;
     options.ShowDeveloperTools = DeveloperToolsVisibility.Never;
+    options.AddPreferredSecuritySchemes("CookieAuth");
 });
 
 app.UseAuthentication();
@@ -92,16 +106,16 @@ app.UseAuthorization();
 // --- DATA ---
 var users = new List<User> 
 { 
-    new("admin", "password", "Admin"),
-    new("bob", "password", "User") 
+    new(1, "admin", "password", "Admin"),
+    new(2, "bob", "password", "User") 
 };
 
 var userRefreshTokenDict = new Dictionary<string, string>();
 
 // --- ENDPOINTS ---
 
-// 1. Login (Returns Token in Body)
-app.MapPost("/login", (LoginDto loginData) =>
+// 1. Login (Sets Cookies)
+app.MapPost("/login", (LoginDto loginData, HttpContext http) =>
 {
     var user = users.FirstOrDefault(u => u.Username == loginData.Username && u.Password == loginData.Password);
     if (user is null) return Results.Unauthorized();
@@ -111,29 +125,52 @@ app.MapPost("/login", (LoginDto loginData) =>
     
     userRefreshTokenDict[user.Username] = refreshToken;
     
-    // In Bearer flow, we return tokens in the body. Client must save them.
-    return Results.Ok(new { accessToken, refreshToken });
+    var cookieOpts = new CookieOptions { HttpOnly = true, Secure = true, SameSite = SameSiteMode.Strict };
+    
+    http.Response.Cookies.Append("X-Access-Token", accessToken, 
+        new CookieOptions { HttpOnly = true, Secure = true, SameSite = SameSiteMode.Strict, Expires = DateTime.UtcNow.AddMinutes(jwtSettings.AccessTokenMinutes) });
+    
+    http.Response.Cookies.Append("X-Refresh-Token", refreshToken, 
+        new CookieOptions { HttpOnly = true, Secure = true, SameSite = SameSiteMode.Strict, Expires = DateTime.UtcNow.AddDays(jwtSettings.RefreshTokenDays) });
+    
+    http.Response.Cookies.Append("X-Username", user.Username, cookieOpts);
+
+    return Results.Ok(new { message = "Logged in via Cookies" });
 });
 
-// 2. Refresh (Requires Refresh Token in Body)
-app.MapPost("/refresh", (RefreshTokenDto refreshData) =>
+// 2. Refresh (Reads Cookies)
+app.MapPost("/refresh", (HttpContext http) =>
 {
-    // Validate refresh logic here (simplified)
-    if (!userRefreshTokenDict.TryGetValue(refreshData.Username, out var refreshToken) || refreshToken != refreshData.RefreshToken)
+    // CHANGED: Read from Cookies instead of Body DTO
+    http.Request.Cookies.TryGetValue("X-Refresh-Token", out var cookieRefreshToken);
+    http.Request.Cookies.TryGetValue("X-Username", out var cookieUsername);
+
+    if (string.IsNullOrEmpty(cookieRefreshToken) || string.IsNullOrEmpty(cookieUsername))
+    {
+        return Results.Unauthorized();
+    }
+
+    // Validate logic (Same as before)
+    if (!userRefreshTokenDict.TryGetValue(cookieUsername, out var storedRefreshToken) || storedRefreshToken != cookieRefreshToken)
     {
         return Results.Forbid();
     }
 
-    var user = users.FirstOrDefault(u => u.Username == refreshData.Username);
+    var user = users.FirstOrDefault(u => u.Username == cookieUsername);
     if (user is null) return Results.Forbid();
         
     var newAccessToken = GenerateAccessToken(user, jwtSettings.Key, jwtSettings.Issuer, jwtSettings.Audience, jwtSettings.AccessTokenMinutes);
     var newRefreshToken = GenerateRefreshToken();
 
     userRefreshTokenDict[user.Username] = newRefreshToken;
+    
+    http.Response.Cookies.Append("X-Access-Token", newAccessToken, 
+        new CookieOptions { HttpOnly = true, Secure = true, SameSite = SameSiteMode.Strict, Expires = DateTime.UtcNow.AddMinutes(jwtSettings.AccessTokenMinutes) });
 
-    return Results.Ok(new { accessToken = newAccessToken, refreshToken = newRefreshToken });
+    http.Response.Cookies.Append("X-Refresh-Token", newRefreshToken, 
+        new CookieOptions { HttpOnly = true, Secure = true, SameSite = SameSiteMode.Strict, Expires = DateTime.UtcNow.AddDays(jwtSettings.RefreshTokenDays) });
 
+    return Results.Ok(new { message = "Refreshed via Cookies" });
 });
 
 // 3. User Endpoint
@@ -154,7 +191,6 @@ string GenerateAccessToken(User user, string key, string issuer, string audience
     var token = new JwtSecurityToken(issuer, audience, claims, expires: DateTime.UtcNow.AddMinutes(minutes), signingCredentials: creds);
     return new JwtSecurityTokenHandler().WriteToken(token);
 }
-
 string GenerateRefreshToken()
 {
     var randomNumber = new byte[32];
@@ -163,8 +199,6 @@ string GenerateRefreshToken()
     return Convert.ToBase64String(randomNumber);
 }
 
-internal record User(string Username, string Password, string Role);
+internal record User(int Id, string Username, string Password, string Role);
 
 internal record LoginDto(string Username, string Password);
-
-internal record RefreshTokenDto(string Username, string RefreshToken);
